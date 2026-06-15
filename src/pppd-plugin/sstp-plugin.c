@@ -36,7 +36,7 @@
 #include <pppd/fsm.h>
 #include <pppd/lcp.h>
 #include <pppd/eap.h>
-#include <pppd/chap-new.h>
+#include <pppd/chap.h>
 
 #include <sstp-api.h>
 #include <sstp-mppe.h>
