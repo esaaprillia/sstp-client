@@ -31,18 +31,24 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#define USE_EAPTLS
 #include <pppd/pppd.h>
-#include <sstp-api.h>
+#include <pppd/fsm.h>
+#include <pppd/lcp.h>
+#include <pppd/eap.h>
+#include <pppd/chap-new.h>
 
-#ifndef MPPE
-#define MPPE_MAX_KEY_LEN 16
-extern u_char mppe_send_key[MPPE_MAX_KEY_LEN];
-extern u_char mppe_recv_key[MPPE_MAX_KEY_LEN];
-extern int mppe_keys_set;
-#endif
+#include <sstp-api.h>
+#include <sstp-mppe.h>
+
 #define SSTP_MAX_BUFLEN             255
 
-static int sstp_notify_sent = 0;
+#define PPP_PROTO_PAP               0xc023
+#define PPP_PROTO_CHAP              0xc223
+#define PPP_PROTO_EAP               0xc227
+
+
+#define SSTP_MPPE_MAX_KEYSIZE 32
 
 /*!
  * @brief PPP daemon requires this symbol to be exported
@@ -61,12 +67,10 @@ static option_t sstp_option [] =
     }
 };
 
-
 /*!
  * @brief Exchange the MPPE keys with sstp-client
  */
-static void sstp_send_notify(unsigned char *skey, int slen, 
-    unsigned char *rkey, int rlen)
+static void sstp_send_notify()
 {
     struct sockaddr_un addr;
     int ret  = (-1);
@@ -75,10 +79,13 @@ static void sstp_send_notify(unsigned char *skey, int slen,
     uint8_t buf[SSTP_MAX_BUFLEN+1];
     sstp_api_msg_st  *msg  = NULL;
 
+    unsigned char key[SSTP_MPPE_MAX_KEYSIZE];
+    char key_buf[128];
+    int key_len;
+
     /* Open the socket */
     sock = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (sock < 0)
-    {
+    if (sock < 0) {
         fatal("Could not open socket to communicate with sstp-client");
     }
 
@@ -88,44 +95,69 @@ static void sstp_send_notify(unsigned char *skey, int slen,
 
     /* Connect the socket */
     ret = connect(sock, (struct sockaddr*) &addr, alen);
-    if (ret < 0)
-    {
+    if (ret < 0) {
         fatal("Could not connect to sstp-client (%s), %s (%d)", sstp_sock,
             strerror(errno), errno);
     }
 
     /* Create a new message */
     msg = sstp_api_msg_new(buf, SSTP_API_MSG_AUTH);
+    
+    /* If the MPPE keys are set, add them to the message */
+    if (mppe_keys_isset()) {
+    
+        key_len = mppe_get_send_key(key, sizeof(key));
+        if (key_len > 0) {
+            sstp_api_attr_add(msg, SSTP_API_ATTR_MPPE_SEND, key_len, key);
+            if (debug) {
+                dbglog("The mppe send key (%d): %0.*B", key_len, key_len, key);
+            }
+        }
 
-    /* Add the MPPE Send Key */
-    sstp_api_attr_add(msg, SSTP_API_ATTR_MPPE_SEND, 
-            MPPE_MAX_KEY_LEN, skey);
-
-    /* Add the MPPE Recv Key */
-    sstp_api_attr_add(msg, SSTP_API_ATTR_MPPE_RECV, 
-            MPPE_MAX_KEY_LEN, rkey);
-
+        key_len = mppe_get_recv_key(key, sizeof(key));
+        if (key_len > 0) {
+            sstp_api_attr_add(msg, SSTP_API_ATTR_MPPE_RECV, key_len, key);
+            if (debug) {
+                dbglog("The mppe send key (%d): %0.*B", key_len, key_len, key);
+            }
+        }
+        memset(key, 0, sizeof(key));
+    }
+   
     /* Send the structure */
     ret = send(sock, msg, sstp_api_msg_len(msg), 0);
-    if (ret < 0)
-    {
+    if (ret < 0) {
         fatal("Could not send data to sstp-client");
     }
     
     /* Wait for the ACK to be received */
     ret = recv(sock, msg, (sizeof(*msg)), 0);
-    if (ret < 0 || ret != (sizeof(*msg)))
-    {
+    if (ret < 0 || ret != (sizeof(*msg))) {
         fatal("Could not wait for ack from sstp-client");
     }
 
-    /* We have communicated the keys */
-    sstp_notify_sent = 1;
+    /* Clear the buffer, it may contain the MPPE keys */
+    memset(buf, 0, sizeof(buf));
 
     /* Close socket */
     close(sock);
 }
 
+#ifdef USE_PPPD_AUTH_HOOK
+/**
+ * The introduction of pppd-2.4.9 now supports the callback via auth_up_notifier
+ *    which previously was only done when peer had authenticated itself (server side).
+ *
+ * The benefit of this approach, is that we hook in after auth is completed; but before
+ * CCP layer is brought up and will clear the MPPE keys.
+ */
+static void sstp_auth_done(void *arg, int dummy)
+{
+    sstp_send_notify();
+}
+#else
+
+static bool sstp_sent_notify = 0;
 
 /*!
  * @brief Make sure we send notification, if we didn't snoop MSCHAPv2
@@ -136,92 +168,84 @@ static void sstp_send_notify(unsigned char *skey, int slen,
  *
  *  You can configure PAP, CHAP-MD5 and MSCHAP with the NAP service,
  *  these are disabled by Microsoft 2008 server by default.
+ *
+ *  BUG: If the MPPE keys are sent at ip-up; the WIN2K16 server expects 
+ *  the MPPE keys to be all zero.
  */
 static void sstp_ip_up(void *arg, int dummy)
 {
-    if (sstp_notify_sent)
-        return;
+    /* If notify haven't been sent yet, then send all zero for MPPE keys */
+    if (!sstp_sent_notify) {
 
-    /* Auth-Type is not MSCHAPv2, reset the keys and send blank keys */
-    if (!mppe_keys_set)
-    {
-        memset(&mppe_send_key, 0, sizeof(mppe_send_key));
-        memset(&mppe_recv_key, 0, sizeof(mppe_recv_key));
+        /* Send *blank* MPPE keys to the sstpc client */
+        sstp_send_notify();
+        sstp_sent_notify = 1;
     }
 
-    /* Send the MPPE keys to the sstpc client */
-    sstp_send_notify(mppe_send_key, sizeof(mppe_send_key),
-            mppe_recv_key, sizeof(mppe_recv_key));
+    snoop_recv_hook = NULL;
 }
-
 
 /*!
- * @brief Snoop the Authentication complete packet, steal MPPE keys
+ * @brief Snoop the Authentication Success packet, steal MPPE keys
  */
-static void sstp_snoop_send(unsigned char *buf, int len)
+static void sstp_snoop_recv(unsigned char *buf, int len)
 {
-    uint16_t protocol;
-
+    unsigned int psize;
+    unsigned int proto;
+    bool pcomp;
+    
     /* Skip the HDLC header */
-    buf += 2;
-    len -= 2;
+    if (buf[0] == 0xFF && buf[1] == 0x03) {
+        buf += 2;
+        len -= 2;
+    }
+    
+    /* Take into account protocol compression */
+    pcomp = (buf[0] & 0x10);
+    psize = pcomp ? 1 : 2;
 
     /* Too short of a packet */
-    if (len <= 0)
-        return;
-
-    /* Stop snooping if it is not a LCP Auth Chap packet */
-    protocol = (buf[0] & 0x10) ? buf[0] : (buf[0] << 8 | buf[1]);
-    if (protocol != 0xC223)
-        return;
-
-    /* Skip the LCP header */
-    buf += 2;
-    len -= 2;
-
-    /* Too short of a packet */
-    if (len <= 0)
-        return;
-
-    /* Check if packet is a CHAP response */
-    if (buf[0] != 0x02)
-        return;
-
-    /* We should send sstpc empty keys .. */
-    if (!mppe_keys_set)
-    {
+    if (len <= psize) {
         return;
     }
 
-    /* ChapMS2/ChapMS sets the MPPE keys as a part of the make_response
-     * call, these might not be enabled dependent on negotiated options
-     * such as MPPE and compression. If they are enabled, the keys are 
-     * zeroed out in ccp.c before ip-up is called.
-     * 
-     * Let's steal the keys here over implementing all the code to
-     * calculate the MPPE keys here.
-     */
-    if (debug)
+    /* Stop snooping if it is not a LCP Auth CHAP/EAP packet */
+    proto = (pcomp) ? buf[0] : (buf[0] << 8 | buf[1]);
+    if (proto != PPP_PROTO_CHAP && proto != PPP_PROTO_EAP) {
+        return;
+    }
+    
+    buf += psize;
+    len -= psize;
+
+    /* Look for a SUCCESS packet indicating authentication complete */
+    switch (proto) 
     {
-        char key[255];
-        dbglog("%s: mppe keys are set", __func__);
-
-        /* Add the MPPE Send Key */
-        slprintf(key, sizeof(key)-1, "%0.*B", MPPE_MAX_KEY_LEN,
-                 mppe_send_key);
-        dbglog("%s: The mppe send key: %s", __func__, key);
-
-        /* Add the MPPE Recv Key */
-        slprintf(key, sizeof(key)-1, "%0.*B", MPPE_MAX_KEY_LEN,
-                 mppe_recv_key );
-        dbglog("%s: The mppe recv key: %s", __func__, key);
+    case PPP_PROTO_CHAP:
+        if (buf[0] != CHAP_SUCCESS) {
+            return;
+        }
+        break;
+    case PPP_PROTO_EAP:
+        if (buf[0] != EAP_SUCCESS) {
+            return;
+        }
+        break;
+    }
+    
+    /* Did the MPPE keys get set? */
+    if (!mppe_keys_isset()) {
+        return;
     }
 
-    /* Send the MPPE keys to the sstpc client */
-    sstp_send_notify(mppe_send_key, sizeof(mppe_send_key),
-            mppe_recv_key, sizeof(mppe_recv_key));
+    /* Notify SSTPC of the MPPE keys */
+    sstp_send_notify();
+    sstp_sent_notify = 1;
+
+    /* Disable the send-hook */
+    snoop_recv_hook = NULL;
 }
-
+#endif // USE_PPPD_AUTH_HOOK
 
 /*!
  * @brief PPP daemon requires this symbol to be exported for initialization
@@ -234,11 +258,14 @@ void plugin_init(void)
     /* Allow us to intercept options */
     add_options(sstp_option);
 
+#ifdef USE_PPPD_AUTH_HOOK
+    add_notifier(&auth_up_notifier, sstp_auth_done, NULL);
+#else
     /* Let's snoop for CHAP authentication */
-    snoop_send_hook = sstp_snoop_send;
+    snoop_recv_hook = sstp_snoop_recv;
 
     /* Add ip-up notifier */
     add_notifier(&ip_up_notifier, sstp_ip_up, NULL);
+#endif
 }
-
 
